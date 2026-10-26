@@ -1,0 +1,162 @@
+name: Free-tier AI draft (manual, approval required)
+on:
+  workflow_dispatch:
+    inputs:
+      topic_mode:
+        description: '주제 선택: next는 새 주제로 순환, top은 매번 1위 주제'
+        required: true
+        default: next
+        type: choice
+        options:
+          - next
+          - top
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: free-ai-draft
+  cancel-in-progress: false
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BLOG_RSS_URLS: ${{ vars.BLOG_RSS_URLS }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CONFIRM_GEMINI_FREE_TIER: ${{ vars.CONFIRM_GEMINI_FREE_TIER }}
+      ALLOW_PAID_GENERATION: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Collect topic candidates
+        run: python automation_stage1.py --output output/topics
+      - name: Choose topic (rotate on each new workflow run)
+        id: choose
+        env:
+          TOPIC_MODE: ${{ inputs.topic_mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOPICS="$(find output/topics -type f -name 'topics-*.json' | sort | tail -n 1)"
+          python - "$TOPICS" "$TOPIC_MODE" "$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          from pathlib import Path
+          topics = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("topics", [])
+          if not topics:
+              raise SystemExit("No topics available")
+          mode = sys.argv[2]
+          run_number = int(sys.argv[3])
+          index = 0 if mode == "top" else (run_number - 1) % len(topics)
+          print(f"index={index}")
+          print(f"selected_title={topics[index]['title'][:100].replace(chr(10), ' ')}")
+          PY
+      - name: Prepare research context
+        run: |
+          mkdir -p output/drafts
+          echo '공식 법안 원문 및 현행 조문은 자동 확인되지 않았습니다. 확인된 RSS 정보 이외의 세율, 공제, 감세액을 단정하지 마세요.' > output/drafts/research-context.txt
+      - name: Collect public community discussion evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOPICS="$(find output/topics -type f -name 'topics-*.json' | sort | tail -n 1)"
+          python community_research.py --topics "$TOPICS" --topic-index "${{ steps.choose.outputs.index }}" --output output/drafts/community-research.json
+      - name: Validate Python syntax before generation
+        run: python -m py_compile cloud_free_writer.py automation_stage1.py community_research.py
+      - name: Generate one unverified draft (no retries, no paid fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOPICS="$(find output/topics -type f -name 'topics-*.json' | sort | tail -n 1)"
+          if [ -z "$TOPICS" ]; then
+            echo "::error::No topics JSON file was produced"
+            exit 1
+          fi
+          echo "Using topic file: $TOPICS"
+          python - "$TOPICS" <<'PY'
+          import json, sys
+          from pathlib import Path
+          data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          n = len(data.get("topics", []))
+          print(f"Topics in selected file: {n}")
+          if n == 0:
+              raise SystemExit("ERROR: Selected topic file has zero topics")
+          PY
+          python cloud_free_writer.py --topics "$TOPICS" --topic-index "${{ steps.choose.outputs.index }}" --research-file output/drafts/research-context.txt --community-file output/drafts/community-research.json --output output/drafts/free-draft.md
+          if [ ! -s output/drafts/free-draft.md ]; then
+            echo "::error::Draft missing or empty after generation"
+            exit 1
+          fi
+          echo "Draft verified: $(wc -c < output/drafts/free-draft.md) bytes"
+      - name: Audit draft against collected RSS evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOPICS="$(find output/topics -type f -name 'topics-*.json' | sort | tail -n 1)"
+          python cloud_free_writer.py --verify --topics "$TOPICS" --topic-index "${{ steps.choose.outputs.index }}" --output output/drafts/free-draft.md
+          test -s output/drafts/fact-check-report.md
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: unverified-ai-draft
+          path: output/drafts/
+          retention-days: 7
+      - name: Show draft in mobile-friendly job summary
+        if: success()
+        shell: bash
+        run: |
+          if [ -s output/drafts/free-draft.md ]; then
+            {
+              echo '## 🔎 근거 점검 보고서 및 AI 블로그 원고'
+              echo ''
+              echo '선택된 주제: ${{ steps.choose.outputs.selected_title }}'
+              echo ''
+              cat output/drafts/fact-check-report.md
+              echo ''
+              echo '커뮤니티 근거 파일: artifact의 community-research.json (수집된 공개 글만 근거로 활용)'
+              echo ''
+              echo '---'
+              echo ''
+              cat output/drafts/free-draft.md
+              echo ''
+              echo '---'
+              echo '## 📋 원고 전체 복사'
+              echo '아래 원고 상자 오른쪽 위의 **복사 아이콘**을 누르면 원고 전체가 복사됩니다. (GitHub 코드 블록 기본 기능)'
+              echo ''
+              echo '`````markdown'
+              cat output/drafts/free-draft.md
+              echo ''
+              echo '`````'
+              echo ''
+              echo '## 발행 전 최종 승인 체크리스트'
+              echo '- [ ] 핵심 기업·수치·날짜를 원문 및 공식자료와 대조'
+              echo '- [ ] 과거와 현재 비교 및 실적·제휴 영향 확인'
+              echo '- [ ] 사실과 전망·필자 의견을 구분'
+              echo '- [ ] 제목·첫 세 문장·중복 표현·검색 키워드 점검'
+              echo '- [ ] 네이버·티스토리 원고를 최종 검토하고 직접 발행 승인'
+              echo ''
+              echo '**이 워크플로는 자동 발행하지 않습니다.**'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Open review pull request (merge = editorial approval only)
+        if: success() && vars.ENABLE_REVIEW_PR == 'YES'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s output/drafts/free-draft.md || exit 0
+          BRANCH="review/ai-draft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          mkdir -p drafts/pending
+          cp output/drafts/free-draft.md "drafts/pending/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.md"
+          git add drafts/pending
+          git commit -m "draft: add unverified AI article for human review"
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "검토 요청: AI 블로그 초안 #${GITHUB_RUN_ID}" \
+            --body "AI 생성 초안입니다. Files changed에서 모바일로 읽고 검토하세요. Merge는 내부 원고 승인만 의미하며 네이버/티스토리 발행은 하지 않습니다. 내용과 출처를 확인하고 필요한 부분을 수정한 뒤 병합하세요."

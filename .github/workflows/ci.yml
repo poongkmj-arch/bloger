@@ -1,0 +1,26 @@
+name: MVP tests
+on:
+  push:
+    branches: ["main", "codex/**"]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e '.[dashboard]'
+      - name: Unit and Streamlit tests
+        run: python -m unittest discover -s tests -v
+      - name: Offline dry-run
+        run: blog-mvp import-csv samples/keywords.csv --dry-run
+      - name: Compile Python
+        run: python -m compileall -q src app.py tests
